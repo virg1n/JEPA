@@ -1,11 +1,31 @@
 
 from transformers import TrainingArguments, Trainer, AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup, DataCollatorWithPadding
 from datasets import load_dataset
-import torch
 from torch.utils.data import DataLoader
-import math
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+import torch
+import math
+import os
+from contextlib import nullcontext
+
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+
+
+distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+if distributed:
+    backend = "nccl"
+    dist.init_process_group(backend=backend)
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+else:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+master_process = (not distributed) or dist.get_rank() == 0
 model = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM-135M", torch_dtype=torch.bfloat16).to(device)
 
 tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M")
@@ -24,7 +44,7 @@ accum_steps = 4
 lr = 2e-5
 weight_decay = 0.01
 num_epochs = 3
-
+use_compile = True
 
 
 def tokenize(batch):
@@ -32,10 +52,7 @@ def tokenize(batch):
     ans = tokenizer(batch["query"], truncation=True, max_length=MAX_LEN - 1, add_special_tokens=False)
 
     eos_id = tokenizer.eos_token_id
-    # tokenized["labels"] = [
-    #     input_ids + [eos_id]
-    #     for input_ids in tokenized["input_ids"]
-    # ]
+
     tokenized = {}
     tokenized["q_ids"] = [input_ids + [eos_id] + [PRED_ID] * K for input_ids in q["input_ids"]]
     tokenized["ans_ids"] =  [input_ids + [eos_id] for input_ids in ans["input_ids"]]
@@ -76,12 +93,15 @@ def collate_fn(samples):
             "ans_ids": ans_ids, "ans_mask": ans_mask,
             "gen_ids": gen_ids, "gen_mask": gen_mask, "labels": labels}
 
-def get_last_token(hidden, mask):
-    idx = mask.sum(1) - 1
+def get_last_token(hidden, mask, offset = -1):
+    idx = mask.sum(1) + offset
     return hidden[torch.arange(hidden.size(0), device=hidden.device), idx]
 
+sampler = DistributedSampler(dataset, shuffle=True) if distributed else None
 
-loader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn = collate_fn)
+loader = DataLoader(dataset, batch_size=8, shuffle=(sampler is None),
+                    sampler=sampler,
+                     collate_fn = collate_fn)
 
 model.config.use_cache = False
 
@@ -102,50 +122,84 @@ optimizer.zero_grad(set_to_none=True)
 
 model.gradient_checkpointing_enable()
 model.train()
+
+
+if distributed:
+    model = DDP(model, device_ids=[local_rank])
+    
+if use_compile:
+    model = torch.compile(model)
+
 num_batches = len(loader)
 remainder = num_batches % accum_steps
 
+loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+
+
 for epoch in range(num_epochs):
+    if distributed:
+        sampler.set_epoch(epoch)
     for step, batch in enumerate(loader):
         batch = {k: v.to(device) for k, v in batch.items()}
 
         labels = batch["labels"].contiguous()
-        p = get_last_token(model(input_ids=batch["q_ids"], attention_mask=batch["q_mask"], output_hidden_states=True).hidden_states[-1], 
-                           mask=batch["q_mask"]) #B, H
-        
-        t = get_last_token(model(input_ids=batch["ans_ids"], attention_mask=batch["ans_mask"], output_hidden_states=True).hidden_states[-1], 
-                        mask=batch["ans_mask"]) #B, H
 
-        jepa_loss = (1 - torch.nn.functional.cosine_similarity(p, t, dim=-1)).mean()
-        output = model(input_ids=batch["gen_ids"], attention_mask=batch["gen_mask"])
-        
-        logits = output.logits[:, :-1, :].contiguous()
-        shifted_labels = labels[:, 1:].contiguous()
-        
+        is_last_batch = (step + 1) == num_batches
+        should_step = ((step + 1) % accum_steps == 0) or is_last_batch
 
-        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
-        loss = loss_fn(
-            logits.view(-1, logits.size(-1)), shifted_labels.view(-1)
+        sync_context = (
+            model.no_sync()
+            if distributed and not should_step
+            else nullcontext()
         )
         
-        # loss = output.loss
-        # print(loss)
-        if step % 500 == 0:
-            print(loss.item())
-            print(jepa_loss)
+        with sync_context:
+            p = get_last_token(model(input_ids=batch["q_ids"], attention_mask=batch["q_mask"], output_hidden_states=True).hidden_states[-1], 
+                            mask=batch["q_mask"]) #B, H
+            
+            t = get_last_token(model(input_ids=batch["ans_ids"], attention_mask=batch["ans_mask"], output_hidden_states=True).hidden_states[-1], 
+                            mask=batch["ans_mask"],  #B, H
+                            offset=-2) # last SQL token before eos
 
-        divisor = remainder if (remainder != 0 and step >= num_batches - remainder) else accum_steps 
+            jepa_loss = (1 - torch.nn.functional.cosine_similarity(p, t, dim=-1)).mean()
+            output = model(input_ids=batch["gen_ids"], attention_mask=batch["gen_mask"])
+            
+            logits = output.logits[:, :-1, :].contiguous()
+            shifted_labels = labels[:, 1:].contiguous()
+            
 
-        loss = loss + JEPA_GAMMA * jepa_loss
-        loss = loss / divisor
-        loss.backward()
+            loss = loss_fn(
+                logits.view(-1, logits.size(-1)), shifted_labels.view(-1)
+            )
+            
+            # loss = output.loss
+            # print(loss)
+            if master_process and step % 500 == 0:
+                print(loss.item())
+                print(jepa_loss)
 
-        if (step + 1) % accum_steps == 0:
+            divisor = remainder if (remainder != 0 and step >= num_batches - remainder) else accum_steps 
+
+            loss = loss + JEPA_GAMMA * jepa_loss
+            loss = loss / divisor
+
+
+            loss.backward()
+
+        if should_step:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             # break
-    if len(loader) % accum_steps != 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step(); scheduler.step(); optimizer.zero_grad()
+
+
+
+if master_process:
+    save_model = model.module if distributed else model
+    save_model.save_pretrained("llm-jepa-smollm-spider")
+    tokenizer.save_pretrained("llm-jepa-smollm-spider")
+
+if distributed:
+    dist.destroy_process_group()
