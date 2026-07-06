@@ -48,7 +48,11 @@ use_compile = True
 
 
 def tokenize(batch):
-    q = tokenizer(batch["question"], truncation=True, max_length=MAX_LEN - (K+1), add_special_tokens=False)
+    text_inputs = [
+        f"Convert natural language to SQL.\n\nFor db_id:[{db_id}]\n\n{question}"
+        for db_id, question in zip(batch["db_id"], batch["question"])]
+
+    q = tokenizer(text_inputs, truncation=True, max_length=MAX_LEN - (K+1), add_special_tokens=False)
     ans = tokenizer(batch["query"], truncation=True, max_length=MAX_LEN - 1, add_special_tokens=False)
 
     eos_id = tokenizer.eos_token_id
@@ -194,10 +198,15 @@ for epoch in range(num_epochs):
             optimizer.zero_grad(set_to_none=True)
             # break
 
-
+def unwrap_model(model):
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    if hasattr(model, "module"):
+        model = model.module
+    return model
 
 if master_process:
-    save_model = model.module if distributed else model
+    save_model = unwrap_model(model)
     save_model.save_pretrained("llm-jepa-smollm-spider")
     tokenizer.save_pretrained("llm-jepa-smollm-spider")
 
