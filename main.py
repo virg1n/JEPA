@@ -44,7 +44,7 @@ accum_steps = 4
 lr = 2e-5
 weight_decay = 0.01
 num_epochs = 3
-use_compile = True
+use_compile = False
 
 
 def tokenize(batch):
@@ -124,15 +124,16 @@ scheduler = get_cosine_schedule_with_warmup(
 
 optimizer.zero_grad(set_to_none=True)
 
-model.gradient_checkpointing_enable()
+if not distributed:
+    model.gradient_checkpointing_enable()
 model.train()
 
+if use_compile and not distributed:
+    model = torch.compile(model)
 
 if distributed:
     model = DDP(model, device_ids=[local_rank])
     
-if use_compile:
-    model = torch.compile(model)
 
 num_batches = len(loader)
 remainder = num_batches % accum_steps
